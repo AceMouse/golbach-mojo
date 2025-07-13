@@ -65,9 +65,14 @@ fn sieve_interval(
     p = sieve_tensor[bid]
     if p == 0: # not a prime to sieve
         return
-    first = bid * Int(A+bid-1//bid)-A + tid*bid
+    first = bid * ceildiv(A,bid)
+    if first < 2*bid:
+        first = 2*bid
+    first = first - A + tid*bid
+#    if tid == 0:
+#        print(tid,bid,first)
     for i in range(first, interval_size, bdim*bid):
-        #        print(i+A, " is not prime (stride ", bdim*bid, ")")
+#        print(i+A, " is not prime (stride ", bdim*bid, ")")
         interval_tensor[i] = 0
 
 def main():
@@ -141,10 +146,11 @@ def main():
     sieve_tensor = LayoutTensor[bool_dtype,sieve_layout](sieve_device_buffer)
     interval_tensor = LayoutTensor[int_dtype,interval_layout](interval_device_buffer)
     ctx.synchronize()
+    A = 0
     ctx.enqueue_function[sieve_interval](
         sieve_tensor,
         interval_tensor,
-        0,
+        A,
         grid_dim=num_blocks,
         block_dim=block_size,
     )
@@ -156,7 +162,7 @@ def main():
         for i in range(interval_size-1,-1,-1):
             if interval_host_buffer[i]:
                 prime_count += 1
-                print(String(i))
+                print(String(i+A))
         print(prime_count)
 
 
