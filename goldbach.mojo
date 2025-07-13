@@ -1,9 +1,11 @@
 from math import sqrt
-from math import ceildiv
-from sys import argv    
+from math import ceildiv, iota
+from sys import argv, num_physical_cores, simdwidthof
 from algorithm import sync_parallelize, vectorize
 from collections import BitSet
 from os import Atomic
+alias int_type = DType.uint64
+alias simd_width = simdwidthof[int_type]()
 struct Sieve(Movable, StringableRaising):
     var top: Int
     var prime_count: Int
@@ -93,9 +95,25 @@ struct Sieve(Movable, StringableRaising):
             if self[p]:
                 first = p*Int((low+p-1)/p)
                 first += (first < low)*p
-                while first <= B:
+                while (first <= B):
                     set.set(first-low)
                     first += p
+
+#                count = Int((B-first)//p)+1
+#                if count == 1:
+#                    set.set(first-low)
+#                    continue
+#                fn clear[i:Int]():
+#                    set.set(first-low+i*p)
+#                for i in range(count):
+#                    set.set(first-low+i*p)
+#                
+#                @parameter
+#                fn clear[simd_width:Int](wid:Int):
+#                    to_clear = first-low+iota[int_type, simd_width](wid)*p
+#                    for i in range(simd_width):
+#                        set.set(UInt(to_clear[i]))
+#                vectorize[clear,simd_width](count)
         for i in range(B-low+1+1):
             if not set.test(i):
                 res.append(i+low)
@@ -122,9 +140,16 @@ struct Sieve(Movable, StringableRaising):
                     res.append(p)
                 first = p*Int((low+p-1)/p)
                 first += (first < low)*p
-                while first <= B:
+                while (first <= B):
                     set.clear(first-low)
                     first += p
+                #count = Int((B-first)//p)
+                #@parameter
+                #fn clear[simd_width:Int](wid:Int):
+                #    to_clear = first-low+iota[int_type, simd_width](wid)*p
+                #    for i in range(simd_width):
+                #        set.clear(UInt(to_clear[i]))
+                #vectorize[clear,simd_width](count)
         for i in range(len(set)):
             if set.test(i):
                 res.append(i+low)
@@ -273,7 +298,7 @@ def format_float(f:Float64, decimal_places:Int) -> String:
     res = ""
     idx = 0
     after_dot_idx = 0
-    for ch in sf:
+    for ch in sf.codepoint_slices():
         idx+=1
         if ch == '.':
             after_dot_idx = idx

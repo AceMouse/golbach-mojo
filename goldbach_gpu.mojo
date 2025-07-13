@@ -6,14 +6,17 @@ from time import monotonic
 from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from gpu.id import block_idx, thread_idx, block_dim
-
-alias delta = Int(10)
-alias interval_size = Int(1e6)
-alias sieve_size = Int(1e6)
+#from max.kernels.nn.arg_nonzero import arg_nonzero, arg_nonzero_shape
+alias delta = Int(10e4)
+alias interval_size = Int(10e6)
+alias prime_interval_size = delta+interval_size
+alias shape_size = 2
+alias sieve_size = Int(1e7)
 alias bool_dtype = DType.uint8
 alias int_dtype = DType.uint64
 alias sieve_layout = Layout.row_major(sieve_size)
 alias interval_layout = Layout.row_major(interval_size)
+alias shape_layout = Layout.row_major(shape_size)
 
 
 def Conv(n : String) -> Int:
@@ -45,25 +48,25 @@ alias block_size = 32
 alias num_blocks = sieve_size
 
 
+fn set_interval(
+    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
+):
+    var idx = block_idx.x*block_dim.x + thread_idx.x
+    if idx >= prime_interval_size: # out of bounds
+        return
+    interval_tensor[idx] = 1
 fn sieve_interval(
     sieve_tensor: LayoutTensor[bool_dtype, sieve_layout, MutableAnyOrigin],
     interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
     A:Int
 ):
-    """Calculate the element-wise sum of two vectors on the GPU."""
-
     var tid = thread_idx.x
-    var bid = block_idx.x
-    var bdim = block_dim.x
-    
-    if A+bid < 2 and tid == 0:
-        interval_tensor[A+bid] = 0
-        return
-        
-    if bid >= sieve_size or bid >= interval_size+A: # out of bounds
+    var bid = block_idx.x*2|1
+    var bdim = block_size
+    if bid >= sieve_size or bid >= prime_interval_size+A: # out of bounds
         return
     p = sieve_tensor[bid]
-    if p == 0: # not a prime to sieve
+    if p == 0: # bid is not prime
         return
     first = bid * ceildiv(A,bid)
     if first < 2*bid:
@@ -71,9 +74,40 @@ fn sieve_interval(
     first = first - A + tid*bid
 #    if tid == 0:
 #        print(tid,bid,first)
-    for i in range(first, interval_size, bdim*bid):
-#        print(i+A, " is not prime (stride ", bdim*bid, ")")
+    for i in range(first, prime_interval_size, block_size*bid):
+        #        print(i+A, " is not prime (stride ", bdim*bid, ")")
         interval_tensor[i] = 0
+
+fn primes_from_sieved_interval(
+    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
+    A:Int
+):
+    var idx = block_idx.x*block_dim.x + thread_idx.x
+    if idx >= prime_interval_size: # out of bounds
+        return
+    interval_tensor[idx] *= idx+A
+
+fn check_goldbach(
+    sieve_tensor: LayoutTensor[bool_dtype, sieve_layout, MutableAnyOrigin],
+    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
+    A_prime:Int,
+    A:Int
+):
+    var idx = block_idx.x*block_dim.x + thread_idx.x
+    var n = A+idx*2
+    
+    if n > A+interval_size or n < 6:
+        return
+
+    for lo in range(3,delta,2):
+        hi = n-lo
+        if hi < A_prime:
+            break
+        if sieve_tensor[lo] and interval_tensor[hi-A_prime]:
+            #            print(lo,"+",hi,"=",n)
+            return
+    print(n," is a counter example")
+    
 
 def main():
     @parameter
@@ -84,8 +118,6 @@ def main():
 
     sieve_host_buffer = ctx.enqueue_create_host_buffer[bool_dtype](sieve_size).enqueue_fill(1)
     sieve_device_buffer = ctx.enqueue_create_buffer[bool_dtype](sieve_size).enqueue_fill(1)
-    interval_host_buffer = ctx.enqueue_create_host_buffer[int_dtype](interval_size).enqueue_fill(1)
-    interval_device_buffer = ctx.enqueue_create_buffer[int_dtype](interval_size).enqueue_fill(1)
 
 
 
@@ -141,30 +173,63 @@ def main():
                 print(String(i))
         print(String(prime_count))
     
-    sieve_host_buffer.enqueue_copy_to(dst=sieve_device_buffer)
-    ctx.synchronize()
-    sieve_tensor = LayoutTensor[bool_dtype,sieve_layout](sieve_device_buffer)
-    interval_tensor = LayoutTensor[int_dtype,interval_layout](interval_device_buffer)
-    ctx.synchronize()
-    A = 0
-    ctx.enqueue_function[sieve_interval](
-        sieve_tensor,
-        interval_tensor,
-        A,
-        grid_dim=num_blocks,
-        block_dim=block_size,
-    )
-    ctx.synchronize()
-    interval_host_buffer.enqueue_copy_from(src=interval_device_buffer)
-    ctx.synchronize()
-    if print_intervals:
-        prime_count = 0
-        for i in range(interval_size-1,-1,-1):
-            if interval_host_buffer[i]:
-                prime_count += 1
-                print(String(i+A))
-        print(prime_count)
-
-
     t2 = monotonic()
+    sieve_host_buffer.enqueue_copy_to(dst=sieve_device_buffer)
+    sieve_tensor = LayoutTensor[bool_dtype,sieve_layout](sieve_device_buffer)
+    interval_host_buffer = ctx.enqueue_create_host_buffer[int_dtype](prime_interval_size).enqueue_fill(1)
+    interval_device_buffer = ctx.enqueue_create_buffer[int_dtype](prime_interval_size)
+    interval_tensor = LayoutTensor[int_dtype,interval_layout](interval_device_buffer)
+
+    nonzero_shape_device_buffer = ctx.enqueue_create_buffer[int_dtype](shape_size)
+    nonzero_shape_tensor = LayoutTensor[int_dtype,shape_layout](nonzero_shape_device_buffer)
+    nonzero_shape_host_buffer = ctx.enqueue_create_host_buffer[int_dtype](shape_size).enqueue_fill(0)
+
+    prime_device_buffer = ctx.enqueue_create_buffer[int_dtype](prime_interval_size)
+    prime_tensor = LayoutTensor[int_dtype,interval_layout](interval_device_buffer)
+
+    for A in range(0,to,interval_size):
+        sub = delta if A>=delta else 0
+        prime_A = A-sub
+        ctx.enqueue_function[set_interval](
+            interval_tensor,
+            grid_dim=Int(ceildiv(prime_interval_size,block_size)),
+            block_dim=block_size,
+        )
+        ctx.enqueue_function[sieve_interval](
+            sieve_tensor,
+            interval_tensor,
+            prime_A,
+            grid_dim=Int(ceildiv(top,2)),
+            block_dim=block_size,
+        )
+        ctx.enqueue_function[check_goldbach](
+            sieve_tensor,
+            interval_tensor,
+            prime_A,
+            A,
+            grid_dim=Int(ceildiv(prime_interval_size,block_size*2)),
+            block_dim = block_size,
+        )
+        # interval_host_buffer.enqueue_copy_from(src=interval_device_buffer)
+        # nonzero_shape_host_buffer.enqueue_copy_from(src=nonzero_shape_device_buffer)
+        # ctx.synchronize()
+        # if print_intervals:
+        #     prime_count = 0
+        #     for i in range(prime_interval_size-1,sub-1,-1):
+        #         if interval_host_buffer[i]:
+        #             prime_count += 1
+#       #              print(String(i+prime_A))
+        #     print("primes in range [",A,":",A+interval_size,"]:",prime_count)
+        #     print("nonzero shape in range [",A,":",A+interval_size,"]:",nonzero_shape_host_buffer[0],nonzero_shape_host_buffer[1])
+
+    ctx.synchronize()
+
+    t3 = monotonic()
+    mil10_nums_per_sec = (1e2*Float64(top))/Float64(t2-t1)
+    print("Initial sieving took " + String(Float64(t2-t1)/1e9) +" seconds")
+    print("Sieved : " + format_float(mil10_nums_per_sec,2)+"e+7 numbers/s                   ")
+
+    mil10_nums_per_sec = (1e2*Float64(to-fro))/Float64(t3-t2)
+    print("Checking took " + String(Float64(t3-t2)/1e9) +" seconds")
+    print("Checked : " + format_float(mil10_nums_per_sec,2)+"e+7 numbers/s                   ")
     return
