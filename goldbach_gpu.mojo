@@ -6,7 +6,6 @@ from time import monotonic
 from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from gpu.id import block_idx, thread_idx, block_dim
-#from max.kernels.nn.arg_nonzero import arg_nonzero, arg_nonzero_shape
 alias delta = Int(10e4)
 alias interval_size = Int(10e6)
 alias prime_interval_size = delta+interval_size
@@ -181,11 +180,6 @@ def main():
     interval_tensor = LayoutTensor[int_dtype,interval_layout](interval_device_buffer)
 
     nonzero_shape_device_buffer = ctx.enqueue_create_buffer[int_dtype](shape_size)
-    nonzero_shape_tensor = LayoutTensor[int_dtype,shape_layout](nonzero_shape_device_buffer)
-    nonzero_shape_host_buffer = ctx.enqueue_create_host_buffer[int_dtype](shape_size).enqueue_fill(0)
-
-    prime_device_buffer = ctx.enqueue_create_buffer[int_dtype](prime_interval_size)
-    prime_tensor = LayoutTensor[int_dtype,interval_layout](interval_device_buffer)
 
     for A in range(0,to,interval_size):
         sub = delta if A>=delta else 0
