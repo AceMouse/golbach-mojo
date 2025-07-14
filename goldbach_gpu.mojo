@@ -24,6 +24,8 @@ from gpu.host import DeviceContext
 from gpu import warp, block
 from layout import Layout, LayoutTensor
 from gpu.id import block_idx, thread_idx, block_dim
+from nn import argmaxmin_gpu
+from buffer import NDBuffer
 
 alias delta = Int(1e4)  
 alias interval_size = Int(10e6)
@@ -66,7 +68,7 @@ alias num_blocks = sieve_size
 alias max_block_size = 1024
 
 fn set_interval(
-    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
+    interval_tensor: LayoutTensor[mut=True, int_dtype, interval_layout],
 ):
     var idx = block_idx.x*block_dim.x + thread_idx.x
     if idx >= prime_interval_size: 
@@ -74,8 +76,8 @@ fn set_interval(
     interval_tensor[idx] = 1
 
 fn sieve_interval(
-    sieve_tensor: LayoutTensor[bool_dtype, sieve_layout, MutableAnyOrigin],
-    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
+    sieve_tensor: LayoutTensor[mut=False, bool_dtype, sieve_layout],
+    interval_tensor: LayoutTensor[mut=True, int_dtype, interval_layout],
     A:Int
 ):
     var tid = thread_idx.x
@@ -95,8 +97,8 @@ fn sieve_interval(
         interval_tensor[i] = 0
 
 fn check_goldbach(
-    sieve_tensor: LayoutTensor[bool_dtype, sieve_layout, MutableAnyOrigin],
-    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
+    sieve_tensor: LayoutTensor[mut=False,bool_dtype, sieve_layout],
+    interval_tensor: LayoutTensor[mut=False,int_dtype, interval_layout],
     A_prime:Int,
     A:Int
 ):
@@ -120,7 +122,7 @@ fn check_goldbach(
     print(n," is a counter example")
 
 fn abs_interval(
-    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin]
+    interval_tensor: LayoutTensor[mut=True,int_dtype, interval_layout]
 ):
     var idx = block_idx.x*block_dim.x + thread_idx.x
     if idx >= interval_size:
@@ -128,8 +130,8 @@ fn abs_interval(
     interval_tensor[idx] = abs(interval_tensor[idx])
 
 fn max_interval(
-    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
-    max_tensor: LayoutTensor[int_dtype, max_layout, MutableAnyOrigin],
+    interval_tensor: LayoutTensor[mut=False,int_dtype, interval_layout],
+    max_tensor: LayoutTensor[mut=True,int_dtype, max_layout],
 ):
     var max : Int = 0
     for i in range(thread_idx.x,interval_size,block_dim.x):
@@ -142,9 +144,9 @@ fn max_interval(
 
 
 fn gather_stats(
-    interval_tensor: LayoutTensor[int_dtype, interval_layout, MutableAnyOrigin],
-    stats_tensor: LayoutTensor[int_dtype, stats_layout, MutableAnyOrigin],
-    max_tensor: LayoutTensor[int_dtype, max_layout, MutableAnyOrigin],
+    interval_tensor: LayoutTensor[mut=False,int_dtype, interval_layout],
+    stats_tensor: LayoutTensor[mut=True,int_dtype, stats_layout],
+    max_tensor: LayoutTensor[mut=False,int_dtype, max_layout],
     A:Int
 ):
     var idx = block_idx.x*block_dim.x + thread_idx.x
@@ -238,7 +240,8 @@ def main():
     stats_tensor = LayoutTensor[int_dtype,stats_layout](stats_device_buffer)
 
     max_tensor = LayoutTensor[int_dtype,max_layout](max_device_buffer)
-
+    interval_ndbuffer = NDBuffer[int_dtype, 1, __origin_of(interval_device_buffer)]()
+    max_ndbuffer =      NDBuffer[int_dtype, 1, __origin_of(max_device_buffer)]()
     for A in range(0,to,interval_size):
         sub = delta if A>=delta else 0
         prime_A = A-sub
@@ -268,12 +271,19 @@ def main():
                 grid_dim=Int(ceildiv(prime_interval_size,block_size)),
                 block_dim = block_size,
             )
-            ctx.enqueue_function[max_interval](
-                interval_tensor,
-                max_tensor,
-                grid_dim=1, # use one block because code is bad. We want to use more but still get the correct first occurrence of a lo
-                block_dim = max_block_size,
+            argmaxmin_gpu.argmaxmin_gpu[
+                dtype=int_dtype, output_type=int_dtype, rank=1, largest=True
+            ](
+                ctx,
+                interval_ndbuffer,
+                max_ndbuffer,
             )
+            #ctx.enqueue_function[max_interval](
+            #    interval_tensor,
+            #    max_tensor,
+            #    grid_dim=1, # use one block because code is bad. We want to use more but still get the correct first occurrence of a lo
+            #    block_dim = max_block_size,
+            #)
             ctx.enqueue_function[gather_stats](
                 interval_tensor,
                 stats_tensor,
