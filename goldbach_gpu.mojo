@@ -26,9 +26,10 @@ from layout import Layout, LayoutTensor
 from gpu.id import block_idx, thread_idx, block_dim
 from nn import argmaxmin_gpu
 from buffer import NDBuffer
+from internal_utils import DeviceNDBuffer, HostNDBuffer
 
 alias delta = Int(1e4)  
-alias interval_size = Int(10e6)
+alias interval_size = Int(10e3)
 alias prime_interval_size = delta+interval_size
 alias sieve_size = Int(1e7)
 alias bool_dtype = DType.uint8
@@ -152,7 +153,7 @@ fn gather_stats(
     var idx = block_idx.x*block_dim.x + thread_idx.x
     var p = 3+idx*2
     
-    if p >= delta or stats_tensor[p] or p > Int(max_tensor[0]):
+    if p >= delta or stats_tensor[p] or p > Int(interval_tensor[Int(max_tensor[0])]):
         return
 
     for i in range(interval_size):
@@ -242,6 +243,8 @@ def main():
     max_tensor = LayoutTensor[int_dtype,max_layout](max_device_buffer)
     interval_ndbuffer = NDBuffer[int_dtype, 1, __origin_of(interval_device_buffer)]()
     max_ndbuffer =      NDBuffer[int_dtype, 1, __origin_of(max_device_buffer)]()
+    var device_in = DeviceNDBuffer[int_dtype, 1](interval_size, ctx=ctx)
+    var device_out_idxs = DeviceNDBuffer[int_dtype, 1](1, ctx=ctx)
     for A in range(0,to,interval_size):
         sub = delta if A>=delta else 0
         prime_A = A-sub
@@ -271,13 +274,15 @@ def main():
                 grid_dim=Int(ceildiv(prime_interval_size,block_size)),
                 block_dim = block_size,
             )
+            ctx.enqueue_copy(device_in.buffer, interval_device_buffer)
             argmaxmin_gpu.argmaxmin_gpu[
                 dtype=int_dtype, output_type=int_dtype, rank=1, largest=True
             ](
                 ctx,
-                interval_ndbuffer,
-                max_ndbuffer,
+                device_in.tensor,
+                device_out_idxs.tensor,
             )
+            ctx.enqueue_copy(max_device_buffer,device_out_idxs.buffer)
             #ctx.enqueue_function[max_interval](
             #    interval_tensor,
             #    max_tensor,
