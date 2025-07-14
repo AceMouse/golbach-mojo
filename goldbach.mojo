@@ -4,8 +4,13 @@ from sys import argv, num_physical_cores, simdwidthof
 from algorithm import sync_parallelize, vectorize
 from collections import BitSet
 from os import Atomic
+from time import monotonic
+from gpu.host import DeviceContext
+from sys import has_accelerator
+
 alias int_type = DType.uint64
 alias simd_width = simdwidthof[int_type]()
+
 struct Sieve(Movable, StringableRaising):
     var top: Int
     var prime_count: Int
@@ -15,6 +20,7 @@ struct Sieve(Movable, StringableRaising):
         self.top = 0;
         self.prime_count = 0
         self.data =  BitSet[10000000]()
+
     def __str__(self) -> String:
         cols = 20
         out = "top: "+String(self.top)+"\n"
@@ -40,7 +46,6 @@ struct Sieve(Movable, StringableRaising):
         else: 
             self.data.clear(idx)
 
-
     def expand_sieve(mut self, ntop:Int):
         new_top = ntop + 1
         if new_top <= self.top:
@@ -56,15 +61,12 @@ struct Sieve(Movable, StringableRaising):
                 for p in range(i+i,self.top, i):
                     self[p] = 0
 
-    def _expand_sieve_interval(mut self, top_of_interval:Int):
-        self.expand_sieve(sqrt(top_of_interval))
-    
     def is_prime(self, number:Int) -> Int:
         if number <= 0 or number >= self.top or number&1 == 0:
             return number==2
         return self[number]
 
-    def _get_primes_in_range(self,A:Int, B:Int) -> List[Int]:
+    def get_primes_in_range(self,A:Int, B:Int) -> List[Int]:
         low = A
         if low < 0:
             low = 0
@@ -98,60 +100,8 @@ struct Sieve(Movable, StringableRaising):
                 while (first <= B):
                     set.set(first-low)
                     first += p
-
-#                count = Int((B-first)//p)+1
-#                if count == 1:
-#                    set.set(first-low)
-#                    continue
-#                fn clear[i:Int]():
-#                    set.set(first-low+i*p)
-#                for i in range(count):
-#                    set.set(first-low+i*p)
-#                
-#                @parameter
-#                fn clear[simd_width:Int](wid:Int):
-#                    to_clear = first-low+iota[int_type, simd_width](wid)*p
-#                    for i in range(simd_width):
-#                        set.set(UInt(to_clear[i]))
-#                vectorize[clear,simd_width](count)
         for i in range(B-low+1+1):
             if not set.test(i):
-                res.append(i+low)
-        return res
-
-    def get_primes_in_range(mut self,A:Int, B:Int) -> List[Int]:
-        low = A
-        if low < 0:
-            low = 0
-        self._expand_sieve_interval(B)
-        set = BitSet[1000000]()
-        for i in range(B-low+1+1,-1,-1):
-            set.set(i)
-
-        if low == 0:
-            set.clear(0)
-            set.clear(1)
-        if low == 1:
-            set.clear(0)
-        var res : List[Int] = []
-        for p in range(0,self.top):
-            if self[p]:
-                if A <= p <= B:
-                    res.append(p)
-                first = p*Int((low+p-1)/p)
-                first += (first < low)*p
-                while (first <= B):
-                    set.clear(first-low)
-                    first += p
-                #count = Int((B-first)//p)
-                #@parameter
-                #fn clear[simd_width:Int](wid:Int):
-                #    to_clear = first-low+iota[int_type, simd_width](wid)*p
-                #    for i in range(simd_width):
-                #        set.clear(UInt(to_clear[i]))
-                #vectorize[clear,simd_width](count)
-        for i in range(len(set)):
-            if set.test(i):
                 res.append(i+low)
         return res
 
@@ -218,35 +168,9 @@ struct Stats:
         self.mutex.unlock()
 
 
-def check_interval(mut s : Sieve, A:Int, B:Int, delta:Int, print_pairs:Int):
-    s.expand_sieve(delta)
-    primes = s.get_primes_in_range(A-delta,B)
-    top = B-(B&1)
-    bot = A+(A&1)
-    if bot < 4:
-        bot = 4
-    start_prime_idx = len(primes)-1
-    for i in range(top,bot-1,-2):
-        while primes[start_prime_idx] >= i-1 and start_prime_idx > 0:
-            start_prime_idx-=1
-        hi_idx = start_prime_idx
-        not_found = 1
-        while hi_idx >= 0:
-            hi = primes[hi_idx]
-            lo = i - hi
-            hi_idx -= 1
-            if s.is_prime(lo):
-                not_found = 0
-                if print_pairs:
-                    print(String(i) +"=" +String(lo)+"+"+String(hi))
-                break
-        if not_found:
-            print(String(i) +" is a counter example!")
-            break
-
-def _check_interval(s : Sieve, A:Int, B:Int, delta:Int, print_pairs:Int, mut stats:Stats):
+def check_interval(s : Sieve, A:Int, B:Int, delta:Int, print_pairs:Int, mut stats:Stats):
     var brun : Float64 = 0
-    primes = s._get_primes_in_range(A-delta,B)
+    primes = s.get_primes_in_range(A-delta,B)
     prev_i = 0
     while primes[prev_i+1] <= A:
         prev_i += 1
@@ -255,8 +179,6 @@ def _check_interval(s : Sieve, A:Int, B:Int, delta:Int, print_pairs:Int, mut sta
         if p-prev == 2:
             brun += 1/p + 1/prev
         prev = p
-    #for p in primes:
-        #print(String(p) + ", ")
     top = B-(B&1)
     bot = A+(A&1)
     if bot < 4:
@@ -312,10 +234,6 @@ def format_float(f:Float64, decimal_places:Int) -> String:
             res += sf[after_dot_idx+i]
     return res
 
-from time import monotonic
-from gpu.host import DeviceContext
-from sys import has_accelerator
-
 def main():
     delta = Int(10e4)
     fro = Int(0)
@@ -348,8 +266,13 @@ def main():
             print_pairs = 1
         if args[a] in ["--print_intervals", "-p"]:
             print_intervals = 1
-        if args[a] in ["--no-terminal", "-nt"]:
+        if args[a] in ["--no_terminal_codes", "-nt"]:
             terminal = 0
+        if args[a] in ["--help", "-h"]:
+            print("usage:",args[0],"[-d|--delta <number>][-f|--from <number>][-t|--to <number>][-m|--max_interval_size][-p|--print_pairs][-p|--print_intervals][-nt|--no_terminal_codes]")
+            print("example:",args[0],"-d 1e4 -f 1e6 -t 1e10 -m 1e6 -p -nt")
+            return
+
         if ao == a:
             a+=1
 
@@ -359,15 +282,13 @@ def main():
         sieve.expand_sieve(sqrt(to))
     else:
         sieve.expand_sieve(delta)
-#    print(String(sieve))
     t2 = monotonic()
     t3 = t2
     p = -1.0
     tasks = ceildiv(to-fro,max_interval_size)
     var counter = Atomic[DType.int32](SIMD[DType.int32, 1](tasks))
     if terminal:
-        #        print("\0337", end='')
-        print("\033[s", end='')
+        print("\0337", end='')
     
     var stats : Stats = Stats(delta)
     @parameter
@@ -378,16 +299,13 @@ def main():
             f = 0
         if print_intervals:
             print("Checking interval ["+String(f)+","+String(t)+"] (diff = " +String(t-f) + ")")
-        _check_interval(sieve,f,t,delta,print_pairs,stats)
+        check_interval(sieve,f,t,delta,print_pairs,stats)
         counter -= 1
         if print_intervals:
             print("Checked interval ["+String(f)+","+String(t)+"] (diff = " +String(t-f) + ")")
         pp = Float64(tasks-(counter.load()[0]))/tasks
         if Int(p*100) < Int(100*pp):
             t3 = monotonic()
-            if terminal:
-                #        print("\0338",end='')
-                print("\033[u", end='')
             p = pp
             est_time = Float64(t3-t2)/p
             rem = (est_time-(t3-t2))/1e9
@@ -414,14 +332,18 @@ def main():
                 ms = " "*(m<10)+"{}m ".format(m)
             ss = " "*(s<10)+"{}s".format(s)
             mil_nums_per_sec = (1e3*Float64((to-fro)*p))/Float64(t3-t2)
+            if terminal:
+                print("\0338",end='')
             print(" " + String(Int(p*100)) +"% done | Time remaining: {}{}{}{}{}   ".format(ys,ds,hs,ms,ss))
             print(" " + " "*len(String(Int(p*100)))+ "       | Checking : " + String(Int(mil_nums_per_sec))+"e+6 numbers/s                   ")
 
     sync_parallelize[worker](tasks)
     t3 = monotonic()
+
     stats.mutex.lock()
     print(stats.to_str(sieve, to))
     stats.mutex.unlock()
+
     mil10_nums_per_sec = (1e2*Float64(sieve.top))/Float64(t2-t1)
     print("Initial sieving took " + String(Float64(t2-t1)/1e9) +" seconds")
     print("Sieved : " + format_float(mil10_nums_per_sec,2)+"e+7 numbers/s                   ")
